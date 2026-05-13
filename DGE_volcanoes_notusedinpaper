@@ -1,0 +1,511 @@
+library('DESeq2')
+library('pheatmap')
+library('tidyverse')
+library('usethis')
+library('devtools')  
+library('ggrepel')
+library('EnhancedVolcano') 
+library('topGO')
+library('org.Dm.eg.db') 
+library('limma')
+
+
+##Set up your directory
+setwd("/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001/")
+
+
+#Read in files
+# If want to read in sample counts individually
+# file.list <- list.files("./", pattern = "*tab")
+# quant_data <- importIsoformExpression(sampleVector = file.list)
+
+# If using matrix.csv from python script
+quant_data <- read.csv("transcript_count_matrix.csv", header = TRUE)
+rownames(quant_data) <- quant_data$transcript_id
+quant_data_old <- read.csv("transcript_count_matrix1.csv", header = TRUE)
+rownames(quant_data_old) <- quant_data_old$transcript_id
+#quant_data_old <- quant_data_old[,c(1,2,3,4)]
+quant_data_old <- quant_data_old[c(quant_data$transcript_id),]
+quant_data <- cbind(quant_data,quant_data_old)
+quant_data <- quant_data[,-18]
+quant_data$transcript_id <- gsub("\\|.*", "", quant_data$transcript_id)
+quant_data <- quant_data[, colnames(quant_data) != "E3"] #remove extra steps
+quant_data <- quant_data[, colnames(quant_data) != "E3a"]
+
+# Add Experiment Design Info
+myDesign <- data.frame(
+  sampleID = colnames(quant_data)[-1],
+  condition = c( "low", "low", "low", "low", "control", "control", "control", "control", "high", "high", "extra", "extra", "extra", "extra", "high", "high", "high"))
+myDesign$batch <- factor(c('a','a','a','a','a','a','a', 'a' ,'a','a', 'a','a','a','a', 'b','b','b'))
+myDesign$batch1 <- factor(c('1','1','2','2','1','1','2', '2' ,'2','2', '1','1','2','2', '3','4','5'))
+head(quant_data)
+colnames(quant_data)
+
+
+#cleaning/tidying data
+# printing original rownames of data frame 
+rownames <- rownames(myDesign) 
+print (rownames) 
+
+# changing row names of data frame 
+rownames(myDesign) <- myDesign$sampleID
+
+rownames(quant_data) <- quant_data$transcript_id
+quant_data <- quant_data[, rownames(myDesign)]
+colnames(myDesign)
+#quant_data <- quant_data[, "gene_id"]
+#quant_data <- quant_data[, -1]
+
+rownames(myDesign)
+
+all(rownames(myDesign) == colnames(quant_data))
+
+all(rownames(myDesign) %in% colnames(quant_data))
+
+#make deseq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = quant_data,
+                              colData = myDesign,
+                              design = ~ batch + condition)
+dds
+
+#This command allow you to filter out the low read counts, the NA results and 0 results. So you take just the one you want to keep and store
+#them into the "keep" vector. 
+
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,]
+
+
+#To run the differential expression genes analysis and save the data in a vector (dds.E)
+dds.E<-DESeq(dds)
+res <- results(dds.E)
+res
+
+resOrdered <- res[order(res$pvalue),]
+summary(res)
+sum(res$padj < 0.1, na.rm=TRUE)
+
+# cooks plot
+par(mar=c(8,5,2,2))
+boxplot(log10(assays(dds.E)[["cooks"]]), range=0, las=2)
+
+#transform for pca visualisation
+vsd <- vst(dds.E, blind=FALSE)
+rld <- rlog(dds.E, blind=FALSE)
+head(assay(vsd), 3)
+
+ntd <- normTransform(dds.E)
+
+#limma batch effect removed
+assay(vsd)<-removeBatchEffect(assay(vsd), vsd$batch)
+
+#heatmap
+library("pheatmap")
+select <- order(rowMeans(counts(dds.E,normalized=TRUE)),
+                decreasing=TRUE)[1:50]
+df <- as.data.frame(colData(dds,E)[,c("batch","condition", "batch1")])
+pheatmap(assay(ntd)[select,], cluster_rows=FALSE, show_rownames=TRUE,
+         cluster_cols=T, annotation_col=df)
+
+
+#plot pca not fancy
+pca=prcomp(t(assay(vsd)))
+library(factoextra)
+fviz_pca_ind(pca)
+fviz_screeplot(pca, addlabels = T) + ggtitle('')
+fviz_pca_ind(pca, pointshape=20, axes = c(1,2)) + scale_color_discrete()+ggtitle('')+coord_fixed()
+fviz_pca_ind(pca, pointshape=20, axes = c(2,3)) + scale_color_discrete()+ggtitle('')+coord_fixed()
+plotPCA(vsd, intgroup=c("condition", "batch"))
+
+#plot fancy pca
+pcaData <- plotPCA(vsd, intgroup=c("batch1", "condition"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=condition, shape=batch1)) +
+  geom_point(size=4) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()
+
+##volcs
+
+#relevel factors so against low not control and do above again
+dds$condition <- relevel(dds$condition, ref = "control")
+dds <- DESeq(dds, betaPrior=FALSE)
+resultsNames(dds)
+
+control_v_high <- lfcShrink(dds, "condition_high_vs_control",  type = c("apeglm"))
+control_v_low <- lfcShrink(dds, "condition_low_vs_control",  type = c("apeglm"))
+control_v_extra <- lfcShrink(dds, "condition_extra_vs_control",  type = c("apeglm"))
+
+
+##Table of results
+# Order by adjusted p value
+#high
+topGenes_CH <-control_v_high$padj < 0.05 & (control_v_high$log2FoldChange>0.55|control_v_high$log2FoldChange<(-0.55))
+topGenes_CH <-topGenes_CH[order(control_v_high$padj)]
+res_CH_ad<-control_v_high[order(control_v_high$padj) , ]
+view(res_CH_ad)
+
+# and save results for this comparison into a text file
+write.table(res_CH_ad,file=paste('/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//ALLtrans0.05', "control", "-", "high", ".txt", sep=""), sep="\t", quote=FALSE)
+
+# and again for significant differential expressed genes only 
+# (per our specified p-value cutoff)
+write.table(res_CH_ad[which(topGenes_CH),],file=paste('/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//SIGtrans0.05lf2c0.55',"control", "-", "high",".txt",sep=""), sep="\t", quote=FALSE)
+
+#low
+topGenes_CL <-control_v_low$padj < 0.05 & (control_v_low$log2FoldChange>0.55|control_v_low$log2FoldChange<(-0.55))
+topGenes_CL <-topGenes_CL[order(control_v_low$padj)]
+res_CL_ad<-control_v_low[order(control_v_low$padj) , ]
+view(res_CL_ad)
+
+# and save results for this comparison into a text file
+write.table(res_CL_ad,file=paste('/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//ALL0.05trans', "control", "-", "low", ".txt", sep=""), sep="\t", quote=FALSE)
+
+# and again for significant differential expressed genes only 
+# (per our specified p-value cutoff)
+write.table(res_CL_ad[which(topGenes_CL),],file=paste('/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//SIG0.05translf2c0.5',"control", "-", "low",".txt",sep=""), sep="\t", quote=FALSE)
+
+#extra
+topGenes_CE <-control_v_extra$padj < 0.05 & (control_v_extra$log2FoldChange>0.55|control_v_extra$log2FoldChange<(-0.55))
+topGenes_CE <-topGenes_CE[order(control_v_extra$padj)]
+res_CE_ad<-control_v_extra[order(control_v_extra$padj) , ]
+view(res_CE_ad)
+
+# and save results for this comparison into a text file
+write.table(res_CE_ad,file=paste('/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//ALLtrans0.05', "control", "-", "extra", ".txt", sep=""), sep="\t", quote=FALSE)
+
+# and again for significant differential expressed genes only 
+# (per our specified p-value cutoff)
+write.table(res_CE_ad[which(topGenes_CE),],file=paste('/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//SIGtrans0.05lf2c0.5',"control", "-", "extra",".txt",sep=""), sep="\t", quote=FALSE)
+
+#Enhanced Volcano plot 
+
+p1=EnhancedVolcano(control_v_high,
+                   lab = rownames(control_v_high),
+                   x = 'log2FoldChange',
+                   y = 'padj',
+                   xlab = bquote(~Log[2]~ 'fold change'),
+                   xlim = c(-10, 10),
+                   FCcutoff = 0.55,
+                   pCutoff = 0.05,
+                   pointSize = 3.0,
+                   title = 'x',
+                   labSize = 2.0,
+                   legendLabSize = 10,
+                   legendIconSize = 3.0,
+                   labCol = 'black',
+                   labFace = 'bold',
+                   boxedLabels = FALSE,
+                   gridlines.major = FALSE,
+                   gridlines.minor = FALSE,
+                   col = c("red", "blue", "black", "grey"),
+                   colAlpha = 1,
+                   drawConnectors = FALSE,
+                   colConnectors = "black")
+p1 + ggplot2::coord_cartesian(ylim=c(0,10))
+
+p1=EnhancedVolcano(control_v_extra,
+                   lab = rownames(control_v_extra),
+                   x = 'log2FoldChange',
+                   y = 'padj',
+                   xlab = bquote(~Log[2]~ 'fold change'),
+                   xlim = c(-10, 10),
+                   FCcutoff = 0.55,
+                   pCutoff = 0.05,
+                   pointSize = 3.0,
+                   title = 'x',
+                   labSize = 2.0,
+                   legendLabSize = 10,
+                   legendIconSize = 3.0,
+                   labCol = 'black',
+                   labFace = 'bold',
+                   boxedLabels = FALSE,
+                   gridlines.major = FALSE,
+                   gridlines.minor = FALSE,
+                   col = c("red", "blue", "black", "grey"),
+                   colAlpha = 1,
+                   drawConnectors = FALSE,
+                   colConnectors = "black")
+p1 + ggplot2::coord_cartesian(ylim=c(0,10))
+
+
+p1=EnhancedVolcano(control_v_low,
+                   lab = rownames(control_v_low),
+                   x = 'log2FoldChange',
+                   y = 'padj',
+                   xlab = bquote(~Log[2]~ 'fold change'),
+                   xlim = c(-10, 10),
+                   FCcutoff = 0.55,
+                   pCutoff = 0.05,
+                   pointSize = 3.0,
+                   title = 'x',
+                   labSize = 2.0,
+                   legendLabSize = 10,
+                   legendIconSize = 3.0,
+                   labCol = 'black',
+                   labFace = 'bold',
+                   boxedLabels = FALSE,
+                   gridlines.major = FALSE,
+                   gridlines.minor = FALSE,
+                   col = c("red", "blue", "black", "grey"),
+                   colAlpha = 1,
+                   drawConnectors = FALSE,
+                   colConnectors = "black")
+p1 + ggplot2::coord_cartesian(ylim=c(0,10))
+
+
+#relevel factors so against low not control and do above again
+dds$condition <- relevel(dds$condition, ref = "low")
+dds <- DESeq(dds, betaPrior=FALSE)
+resultsNames(dds)
+
+low_v_high <- lfcShrink(dds, "condition_high_vs_low",  type = c("apeglm"))
+low_v_extra <- lfcShrink(dds, "condition_extra_vs_low",  type = c("apeglm"))
+
+##Table of results
+# Order by adjusted p value
+#high
+topGenes_LH <-low_v_high$padj < 0.05 & (low_v_high$log2FoldChange>0.55|low_v_high$log2FoldChange<(-0.55))
+topGenes_LH <-topGenes_LH[order(low_v_high$padj)]
+res_LH_ad<-low_v_high[order(low_v_high$padj) , ]
+view(res_LH_ad)
+
+# and save results for this comparison into a text file
+write.table(res_LH_ad,file=paste('/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//ALLtrans0.05', "LOW", "-", "high", ".txt", sep=""), sep="\t", quote=FALSE)
+
+# and again for significant differential expressed genes only 
+# (per our specified p-value cutoff)
+write.table(res_LH_ad[which(topGenes_LH),],file=paste('/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//SIGtrans0.05lf2c0.55',"LOW", "-", "high",".txt",sep=""), sep="\t", quote=FALSE)
+
+#EXTRA
+topGenes_LE <-low_v_extra$padj < 0.05 & (low_v_extra$log2FoldChange>0.55|low_v_extra$log2FoldChange<(-0.55))
+topGenes_LE <-topGenes_LE[order(low_v_extra$padj)]
+res_LE_ad<-low_v_extra[order(low_v_extra$padj) , ]
+view(res_LE_ad)
+
+# and save results for this comparison into a text file
+write.table(res_LE_ad,file=paste('/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//ALLtrans0.05', "LOW", "-", "EXTRA", ".txt", sep=""), sep="\t", quote=FALSE)
+
+# and again for significant differential expressed genes only 
+# (per our specified p-value cutoff)
+write.table(res_LE_ad[which(topGenes_LE),],file=paste('/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//SIGtrans0.05lf2c0.55',"LOW", "-", "EXTRA",".txt",sep=""), sep="\t", quote=FALSE)
+
+p1=EnhancedVolcano(low_v_high,
+                   lab = rownames(low_v_high),
+                   x = 'log2FoldChange',
+                   y = 'padj',
+                   xlab = bquote(~Log[2]~ 'fold change'),
+                   xlim = c(-10, 10),
+                   FCcutoff = 0.55,
+                   pCutoff = 0.05,
+                   pointSize = 3.0,
+                   title = 'x',
+                   labSize = 2.0,
+                   legendLabSize = 10,
+                   legendIconSize = 3.0,
+                   labCol = 'black',
+                   labFace = 'bold',
+                   boxedLabels = FALSE,
+                   gridlines.major = FALSE,
+                   gridlines.minor = FALSE,
+                   col = c("red", "blue", "black", "grey"),
+                   colAlpha = 1,
+                   drawConnectors = FALSE,
+                   colConnectors = "black")
+p1 + ggplot2::coord_cartesian(ylim=c(0,10))
+
+p1=EnhancedVolcano(low_v_extra,
+                   lab = rownames(low_v_extra),
+                   x = 'log2FoldChange',
+                   y = 'padj',
+                   xlab = bquote(~Log[2]~ 'fold change'),
+                   xlim = c(-10, 10),
+                   FCcutoff = 0.55,
+                   pCutoff = 0.05,
+                   pointSize = 3.0,
+                   title = 'x',
+                   labSize = 2.0,
+                   legendLabSize = 10,
+                   legendIconSize = 3.0,
+                   labCol = 'black',
+                   labFace = 'bold',
+                   boxedLabels = FALSE,
+                   gridlines.major = FALSE,
+                   gridlines.minor = FALSE,
+                   col = c("red", "blue", "black", "grey"),
+                   colAlpha = 1,
+                   drawConnectors = FALSE,
+                   colConnectors = "black")
+p1 + ggplot2::coord_cartesian(ylim=c(0,10))
+
+##nicer volcs
+#control v high
+#load the data
+convhigh <- read.table("/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//SIGtrans0.05lf2c0.55control-high.txt", header = TRUE)
+#convhigh <- gsub("\\|.*", "", convhigh$transcriptID)
+
+# Load packages
+library(tidyverse)
+library(ggrepel)
+
+# A short function for outputting the tables
+knitr_table <- function(x) {
+  x %>% 
+    knitr::kable(format = "html", digits = Inf, 
+                 format.args = list(big.mark = ",")) %>%
+    kableExtra::kable_styling(font_size = 15)
+}
+
+data <- convhigh %>% 
+  mutate(
+    Expression = case_when(log2FoldChange >= log(0.55) & padj <= 0.05 ~ "Up-regulated",
+                           log2FoldChange <= -log(0.55) & padj <= 0.05 ~ "Down-regulated",
+                           TRUE ~ "Unchanged")
+  )
+head(data) %>% 
+  knitr_table()
+
+p2 <- ggplot(data, aes(log2FoldChange, -log10(padj))) +
+  geom_point(aes(color = Expression), size = 3) +
+  xlab(expression("log"[2]*"FC")) + 
+  ylab(expression("-log"[10]*"padj")) +
+  scale_color_manual(values = c("dodgerblue3", "firebrick3")) +
+  theme_bw(10) +
+  guides(colour = guide_legend(override.aes = list(size=1.5))) 
+p2  
+
+#low v high
+# load the data
+lowvhigh <- read.table("/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//SIGtrans0.05lf2c0.55LOW-high.txt", header = TRUE)
+
+knitr_table <- function(x) {
+  x %>% 
+    knitr::kable(format = "html", digits = Inf, 
+                 format.args = list(big.mark = ",")) %>%
+    kableExtra::kable_styling(font_size = 15)
+}
+
+data <- lowvhigh %>% 
+  mutate(
+    Expression = case_when(log2FoldChange >= log(0.55) & padj <= 0.05 ~ "Up-regulated",
+                           log2FoldChange <= -log(0.55) & padj <= 0.05 ~ "Down-regulated",
+                           TRUE ~ "Unchanged")
+  )
+head(data) %>% 
+  knitr_table()
+
+p2 <- ggplot(data, aes(log2FoldChange, -log10(padj))) +
+  geom_point(aes(color = Expression), size = 3) +
+  xlab(expression("log"[2]*"FC")) + 
+  ylab(expression("-log"[10]*"padj")) +
+  scale_color_manual(values = c("dodgerblue3", "firebrick3")) +
+  theme_bw(10) +
+  guides(colour = guide_legend(override.aes = list(size=1.5))) 
+p2  
+
+#low vs extra
+# load the data
+lowvextra <- read.table("/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//SIGtrans0.05lf2c0.55LOW-EXTRA.txt", header = TRUE)
+
+knitr_table <- function(x) {
+  x %>% 
+    knitr::kable(format = "html", digits = Inf, 
+                 format.args = list(big.mark = ",")) %>%
+    kableExtra::kable_styling(font_size = 15)
+}
+
+data <- lowvextra %>% 
+  mutate(
+    Expression = case_when(log2FoldChange >= log(0.55) & padj <= 0.05 ~ "Up-regulated",
+                           log2FoldChange <= -log(0.55) & padj <= 0.05 ~ "Down-regulated",
+                           TRUE ~ "Unchanged")
+  )
+head(data) %>% 
+  knitr_table()
+
+p2 <- ggplot(data, aes(log2FoldChange, -log10(padj))) +
+  geom_point(aes(color = Expression), size = 3) +
+  xlab(expression("log"[2]*"FC")) + 
+  ylab(expression("-log"[10]*"padj")) +
+  scale_color_manual(values = c("dodgerblue3", "firebrick3")) +
+  theme_bw(10) +
+  guides(colour = guide_legend(override.aes = list(size=1.5))) 
+p2  
+
+#####high vs extra
+#relevel factors so against high not control and do above again
+dds$condition <- relevel(dds$condition, ref = "high")
+dds <- DESeq(dds, betaPrior=FALSE)
+resultsNames(dds)
+
+extra_v_high <- lfcShrink(dds, "condition_extra_vs_high",  type = c("apeglm"))
+
+
+##Table of results
+# Order by adjusted p value
+#high
+topGenes_HE <-extra_v_high$padj < 0.05 & (extra_v_high$log2FoldChange>0.55|extra_v_high$log2FoldChange<(-0.55))
+topGenes_HE <-topGenes_HE[order(extra_v_high$padj)]
+res_HE_ad<-extra_v_high[order(extra_v_high$padj) , ]
+view(res_HE_ad)
+
+# and save results for this comparison into a text file
+write.table(res_HE_ad,file=paste('/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//ALLtrans0.05', "extra", "-", "high", ".txt", sep=""), sep="\t", quote=FALSE)
+
+# and again for significant differential expressed genes only 
+# (per our specified p-value cutoff)
+write.table(res_HE_ad[which(topGenes_HE),],file=paste('/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//SIGtrans0.05lf2c0.55',"extra", "-", "high",".txt",sep=""), sep="\t", quote=FALSE)
+
+p1=EnhancedVolcano(extra_v_high,
+                   lab = rownames(extra_v_high),
+                   x = 'log2FoldChange',
+                   y = 'padj',
+                   xlab = bquote(~Log[2]~ 'fold change'),
+                   xlim = c(-10, 10),
+                   FCcutoff = 0.55,
+                   pCutoff = 0.05,
+                   pointSize = 3.0,
+                   title = 'x',
+                   labSize = 2.0,
+                   legendLabSize = 10,
+                   legendIconSize = 3.0,
+                   labCol = 'black',
+                   labFace = 'bold',
+                   boxedLabels = FALSE,
+                   gridlines.major = FALSE,
+                   gridlines.minor = FALSE,
+                   col = c("red", "blue", "black", "grey"),
+                   colAlpha = 1,
+                   drawConnectors = FALSE,
+                   colConnectors = "black")
+p1 + ggplot2::coord_cartesian(ylim=c(0,10))
+
+
+# load the data
+highvextra <- read.table("/scratch/evassvis/jc871/run2/X204SC24086896-Z01-F001//SIGtrans0.05lf2c0.55extra-high.txt", header = TRUE)
+
+knitr_table <- function(x) {
+  x %>% 
+    knitr::kable(format = "html", digits = Inf, 
+                 format.args = list(big.mark = ",")) %>%
+    kableExtra::kable_styling(font_size = 15)
+}
+
+data <- highvextra %>% 
+  mutate(
+    Expression = case_when(log2FoldChange >= log(0.55) & padj <= 0.05 ~ "Up-regulated",
+                           log2FoldChange <= -log(0.55) & padj <= 0.05 ~ "Down-regulated",
+                           TRUE ~ "Unchanged")
+  )
+head(data) %>% 
+  knitr_table()
+
+p2 <- ggplot(data, aes(log2FoldChange, -log10(padj))) +
+  geom_point(aes(color = Expression), size = 3) +
+  xlab(expression("log"[2]*"FC")) + 
+  ylab(expression("-log"[10]*"padj")) +
+  scale_color_manual(values = c("dodgerblue3", "firebrick3")) +
+  theme_bw(10) +
+  guides(colour = guide_legend(override.aes = list(size=1.5))) 
+p2  
